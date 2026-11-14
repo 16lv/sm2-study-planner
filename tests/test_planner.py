@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pytest
 from fastapi.testclient import TestClient
 
 from src.study_planner.app import PlannerDatabase, compute_sm2_schedule, create_app
@@ -76,3 +77,22 @@ def test_full_module_assessment_and_revision_workflow() -> None:
     rev_resp = client.post(f"/api/topics/{topic_id}/review", json={"quality": 5})
     assert rev_resp.status_code == 200
     assert rev_resp.json()["repetitions"] == 1
+
+    # Updating module metadata must not wipe child assessments or revision topics
+    update_resp = client.post(
+        "/api/modules",
+        json={
+            "code": "CM2102",
+            "title": "Database Systems & Normalisation",
+            "credits": 20,
+            "semester": "Autumn",
+        },
+    )
+    assert update_resp.status_code == 201
+    assert len(client.get("/api/assessments", params={"module_code": "CM2102"}).json()) == 1
+
+    missing_topic = client.post("/api/topics", params={"module_code": "CM9999", "topic": "Orphan"})
+    assert missing_topic.status_code == 404
+
+    with pytest.raises(ValueError, match="between 0 and 5"):
+        compute_sm2_schedule(quality=6, repetitions=0, easiness=2.5, interval_days=1)

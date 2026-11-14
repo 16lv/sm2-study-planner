@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import sqlite3
+import threading
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Self
@@ -59,9 +62,14 @@ def compute_sm2_schedule(
 
 class PlannerDatabase:
     def __init__(self, db_path: str | Path = ":memory:") -> None:
-        self._conn = sqlite3.connect(str(db_path), check_same_thread=False)
+        self._db_path = str(db_path)
+        self._lock = threading.RLock()
+        self._conn = sqlite3.connect(self._db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA foreign_keys = ON;")
+        if self._db_path != ":memory:":
+            self._conn.execute("PRAGMA journal_mode = WAL;")
+            self._conn.execute("PRAGMA busy_timeout = 5000;")
         self._conn.executescript(
             """
             PRAGMA foreign_keys = ON;
@@ -91,14 +99,16 @@ class PlannerDatabase:
                 repetitions INTEGER NOT NULL DEFAULT 0,
                 easiness REAL NOT NULL DEFAULT 2.5,
                 interval_days INTEGER NOT NULL DEFAULT 1,
-                next_review_date TEXT NOT NULL
+                next_review_date TEXT NOT NULL,
+                FOREIGN KEY(module_code) REFERENCES modules(code)
             );
             """
         )
         self._conn.commit()
 
     def close(self) -> None:
-        self._conn.close()
+        with self._lock:
+            self._conn.close()
 
     def __enter__(self) -> Self:
         return self
@@ -107,69 +117,88 @@ class PlannerDatabase:
         self.close()
 
     def create_module(self, payload: ModuleCreate) -> dict[str, Any]:
-        code = payload.code.upper()
+        code = payload.code.strip().upper()
+        title = payload.title.strip()
+        if len(title) < 3:
+            raise ValueError("Module title must contain at least 3 non-whitespace characters")
         now = datetime.now(UTC).isoformat()
-        self._conn.execute(
-            """
-            INSERT OR REPLACE INTO modules (code, title, credits, semester, created_at)
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            (code, payload.title.strip(), payload.credits, payload.semester, now),
-        )
-        self._conn.commit()
-        return {
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO modules (code, title, credits, semester, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(code) DO UPDATE SET
+                    title = excluded.title,
+                    credits = excluded.credits,
+                    semester = excluded.semester
+                """,
+                (code, title, payload.credits, payload.semester, now),
+            )
+            self._conn.commit()
+            row = self._conn.execute(
+                "SELECT code, title, credits, semester, created_at FROM modules WHERE code = ?",
+                (code,),
+            ).fetchone()
+        return dict(row) if row is not None else {
             "code": code,
-            "title": payload.title.strip(),
+            "title": title,
             "credits": payload.credits,
             "semester": payload.semester,
             "created_at": now,
         }
 
     def list_modules(self) -> list[dict[str, Any]]:
-        rows = self._conn.execute("SELECT * FROM modules ORDER BY code ASC").fetchall()
+        with self._lock:
+            rows = self._conn.execute("SELECT * FROM modules ORDER BY code ASC").fetchall()
         return [dict(r) for r in rows]
 
     def create_assessment(self, payload: AssessmentCreate) -> dict[str, Any]:
-        code = payload.module_code.upper()
-        mod = self._conn.execute(
-            "SELECT code FROM modules WHERE code = ?", (code,)
-        ).fetchone()
-        if mod is None:
-            raise KeyError(f"Module '{code}' does not exist")
+        code = payload.module_code.strip().upper()
+        title = payload.title.strip()
+        if len(title) < 3:
+            raise ValueError("Assessment title must contain at least 3 non-whitespace characters")
+        with self._lock:
+            mod = self._conn.execute(
+                "SELECT code FROM modules WHERE code = ?", (code,)
+            ).fetchone()
+            if mod is None:
+                raise KeyError(f"Module '{code}' does not exist")
 
-        cur = self._conn.execute(
-            """
-            INSERT INTO assessments (module_code, title, weight_pct, due_date, completed)
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            (
-                code,
-                payload.title.strip(),
-                payload.weight_pct,
-                payload.due_date.isoformat(),
-                1 if payload.completed else 0,
-            ),
-        )
-        self._conn.commit()
+            cur = self._conn.execute(
+                """
+                INSERT INTO assessments (module_code, title, weight_pct, due_date, completed)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    code,
+                    title,
+                    payload.weight_pct,
+                    payload.due_date.isoformat(),
+                    1 if payload.completed else 0,
+                ),
+            )
+            self._conn.commit()
+            assessment_id = int(cur.lastrowid or 0)
         return {
-            "id": int(cur.lastrowid or 0),
+            "id": assessment_id,
             "module_code": code,
-            "title": payload.title.strip(),
+            "title": title,
             "weight_pct": payload.weight_pct,
             "due_date": payload.due_date.isoformat(),
             "completed": payload.completed,
         }
 
     def list_assessments(self, module_code: str | None = None) -> list[dict[str, Any]]:
-        if module_code:
-            rows = self._conn.execute(
-                "SELECT * FROM assessments WHERE module_code = ? ORDER BY due_date ASC",
-                (module_code.upper(),),
-            ).fetchall()
-        else:
-            rows = self._conn.execute(
-                "SELECT * FROM assessments ORDER BY due_date ASC"
-            ).fetchall()
+        with self._lock:
+            if module_code:
+                rows = self._conn.execute(
+                    "SELECT * FROM assessments WHERE module_code = ? ORDER BY due_date ASC",
+                    (module_code.strip().upper(),),
+                ).fetchall()
+            else:
+                rows = self._conn.execute(
+                    "SELECT * FROM assessments ORDER BY due_date ASC"
+                ).fetchall()
         return [
             {
                 "id": r["id"],
@@ -183,21 +212,32 @@ class PlannerDatabase:
         ]
 
     def add_revision_topic(self, module_code: str, topic: str) -> dict[str, Any]:
-        code = module_code.upper()
+        code = module_code.strip().upper()
+        cleaned_topic = topic.strip()
+        if not cleaned_topic:
+            raise ValueError("Topic must not be blank")
         today = date.today().isoformat()
-        cur = self._conn.execute(
-            """
-            INSERT INTO revision_topics (
-                module_code, topic, repetitions, easiness, interval_days, next_review_date
-            ) VALUES (?, ?, 0, 2.5, 1, ?)
-            """,
-            (code, topic.strip(), today),
-        )
-        self._conn.commit()
+        with self._lock:
+            mod = self._conn.execute(
+                "SELECT code FROM modules WHERE code = ?", (code,)
+            ).fetchone()
+            if mod is None:
+                raise KeyError(f"Module '{code}' does not exist")
+
+            cur = self._conn.execute(
+                """
+                INSERT INTO revision_topics (
+                    module_code, topic, repetitions, easiness, interval_days, next_review_date
+                ) VALUES (?, ?, 0, 2.5, 1, ?)
+                """,
+                (code, cleaned_topic, today),
+            )
+            self._conn.commit()
+            topic_id = int(cur.lastrowid or 0)
         return {
-            "id": int(cur.lastrowid or 0),
+            "id": topic_id,
             "module_code": code,
-            "topic": topic.strip(),
+            "topic": cleaned_topic,
             "repetitions": 0,
             "easiness": 2.5,
             "interval_days": 1,
@@ -205,28 +245,29 @@ class PlannerDatabase:
         }
 
     def record_topic_review(self, topic_id: int, quality: int) -> dict[str, Any]:
-        row = self._conn.execute(
-            "SELECT * FROM revision_topics WHERE id = ?", (topic_id,)
-        ).fetchone()
-        if row is None:
-            raise KeyError(f"Topic ID {topic_id} not found")
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM revision_topics WHERE id = ?", (topic_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"Topic ID {topic_id} not found")
 
-        reps, ef, interval = compute_sm2_schedule(
-            quality=quality,
-            repetitions=int(row["repetitions"]),
-            easiness=float(row["easiness"]),
-            interval_days=int(row["interval_days"]),
-        )
-        next_date = (date.today() + timedelta(days=interval)).isoformat()
-        self._conn.execute(
-            """
-            UPDATE revision_topics
-            SET repetitions = ?, easiness = ?, interval_days = ?, next_review_date = ?
-            WHERE id = ?
-            """,
-            (reps, ef, interval, next_date, topic_id),
-        )
-        self._conn.commit()
+            reps, ef, interval = compute_sm2_schedule(
+                quality=quality,
+                repetitions=int(row["repetitions"]),
+                easiness=float(row["easiness"]),
+                interval_days=int(row["interval_days"]),
+            )
+            next_date = (date.today() + timedelta(days=interval)).isoformat()
+            self._conn.execute(
+                """
+                UPDATE revision_topics
+                SET repetitions = ?, easiness = ?, interval_days = ?, next_review_date = ?
+                WHERE id = ?
+                """,
+                (reps, ef, interval, next_date, topic_id),
+            )
+            self._conn.commit()
         return {
             "id": topic_id,
             "module_code": row["module_code"],
@@ -239,10 +280,21 @@ class PlannerDatabase:
 
 
 def create_app(db: PlannerDatabase | None = None) -> FastAPI:
-    active_db = db or PlannerDatabase("recalldeck.db")
+    owns_db = db is None
+    active_db = db or PlannerDatabase("sm2_study_planner.db")
+
+    @asynccontextmanager
+    async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+        try:
+            yield
+        finally:
+            if owns_db:
+                active_db.close()
+
     app = FastAPI(
-        title="RecallDeck — University Study & SM-2 Revision Planner",
-        version="1.0.0",
+        title="SM-2 Study Planner",
+        version="1.2.0",
+        lifespan=lifespan,
     )
 
     @app.get("/", response_class=HTMLResponse)
@@ -251,7 +303,7 @@ def create_app(db: PlannerDatabase | None = None) -> FastAPI:
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <title>RecallDeck · University Module & SM-2 Revision Workspace</title>
+  <title>SM-2 Study Planner · Modules & Spaced Repetition</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <style>
     body { background: #0a0a0c; color: #e8e6e1; font-family: system-ui, sans-serif; margin: 0; padding: 2.5rem; }
@@ -267,7 +319,7 @@ def create_app(db: PlannerDatabase | None = None) -> FastAPI:
 </head>
 <body>
   <div class="container">
-    <h1>RecallDeck — University Study &amp; SM-2 Revision Planner</h1>
+    <h1>SM-2 Study Planner</h1>
     <p class="sub">FastAPI · SQLite · SuperMemo-2 Spaced Repetition · REST API (/docs)</p>
     <div class="grid">
       <div class="card">
@@ -308,7 +360,10 @@ def create_app(db: PlannerDatabase | None = None) -> FastAPI:
 
     @app.post("/api/modules", status_code=201)
     def create_module(payload: ModuleCreate) -> dict[str, Any]:
-        return active_db.create_module(payload)
+        try:
+            return active_db.create_module(payload)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     @app.get("/api/modules")
     def list_modules() -> list[dict[str, Any]]:
@@ -320,6 +375,8 @@ def create_app(db: PlannerDatabase | None = None) -> FastAPI:
             return active_db.create_assessment(payload)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     @app.get("/api/assessments")
     def list_assessments(module_code: str | None = None) -> list[dict[str, Any]]:
@@ -327,7 +384,12 @@ def create_app(db: PlannerDatabase | None = None) -> FastAPI:
 
     @app.post("/api/topics", status_code=201)
     def create_topic(module_code: str, topic: str) -> dict[str, Any]:
-        return active_db.add_revision_topic(module_code, topic)
+        try:
+            return active_db.add_revision_topic(module_code, topic)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     @app.post("/api/topics/{topic_id}/review")
     def review_topic(topic_id: int, payload: ReviewUpdate) -> dict[str, Any]:
