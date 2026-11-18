@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sqlite3
 import threading
 from collections.abc import AsyncIterator
@@ -8,7 +9,7 @@ from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Self
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Response
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
@@ -28,6 +29,10 @@ class AssessmentCreate(BaseModel):
     completed: bool = False
 
 
+class AssessmentStatusUpdate(BaseModel):
+    completed: bool
+
+
 class ReviewUpdate(BaseModel):
     quality: int = Field(..., ge=0, le=5)
 
@@ -38,8 +43,7 @@ def compute_sm2_schedule(
     easiness: float,
     interval_days: int,
 ) -> tuple[int, float, int]:
-    # SuperMemo-2 (SM-2) formula: grades < 3 reset the interval back to 1 day.
-    # Easiness factor is clamped at 1.3 so intervals don't get stuck shrinking forever.
+    """Calculate next repetition count, easiness factor (>= 1.3), and interval in days."""
     if quality < 0 or quality > 5:
         raise ValueError("SM-2 quality rating must be between 0 and 5")
 
@@ -89,7 +93,7 @@ class PlannerDatabase:
                 weight_pct REAL NOT NULL,
                 due_date TEXT NOT NULL,
                 completed INTEGER NOT NULL DEFAULT 0,
-                FOREIGN KEY(module_code) REFERENCES modules(code)
+                FOREIGN KEY(module_code) REFERENCES modules(code) ON DELETE CASCADE
             );
 
             CREATE TABLE IF NOT EXISTS revision_topics (
@@ -100,7 +104,7 @@ class PlannerDatabase:
                 easiness REAL NOT NULL DEFAULT 2.5,
                 interval_days INTEGER NOT NULL DEFAULT 1,
                 next_review_date TEXT NOT NULL,
-                FOREIGN KEY(module_code) REFERENCES modules(code)
+                FOREIGN KEY(module_code) REFERENCES modules(code) ON DELETE CASCADE
             );
             """
         )
@@ -151,6 +155,15 @@ class PlannerDatabase:
         with self._lock:
             rows = self._conn.execute("SELECT * FROM modules ORDER BY code ASC").fetchall()
         return [dict(r) for r in rows]
+
+    def delete_module(self, module_code: str) -> bool:
+        code = module_code.strip().upper()
+        if not code:
+            return False
+        with self._lock:
+            cur = self._conn.execute("DELETE FROM modules WHERE code = ?", (code,))
+            self._conn.commit()
+            return cur.rowcount > 0
 
     def create_assessment(self, payload: AssessmentCreate) -> dict[str, Any]:
         code = payload.module_code.strip().upper()
@@ -211,6 +224,29 @@ class PlannerDatabase:
             for r in rows
         ]
 
+    def set_assessment_completed(self, assessment_id: int, completed: bool) -> dict[str, Any]:
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE assessments SET completed = ? WHERE id = ?",
+                (1 if completed else 0, assessment_id),
+            )
+            if cur.rowcount == 0:
+                raise KeyError(f"Assessment ID {assessment_id} not found")
+            self._conn.commit()
+            row = self._conn.execute(
+                "SELECT * FROM assessments WHERE id = ?",
+                (assessment_id,),
+            ).fetchone()
+        assert row is not None
+        return {
+            "id": row["id"],
+            "module_code": row["module_code"],
+            "title": row["title"],
+            "weight_pct": row["weight_pct"],
+            "due_date": row["due_date"],
+            "completed": bool(row["completed"]),
+        }
+
     def add_revision_topic(self, module_code: str, topic: str) -> dict[str, Any]:
         code = module_code.strip().upper()
         cleaned_topic = topic.strip()
@@ -243,6 +279,26 @@ class PlannerDatabase:
             "interval_days": 1,
             "next_review_date": today,
         }
+
+    def list_revision_topics(
+        self, module_code: str | None = None, due_only: bool = False
+    ) -> list[dict[str, Any]]:
+        today = date.today().isoformat()
+        clauses: list[str] = []
+        params: list[Any] = []
+        if module_code:
+            clauses.append("module_code = ?")
+            params.append(module_code.strip().upper())
+        if due_only:
+            clauses.append("next_review_date <= ?")
+            params.append(today)
+        where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT * FROM revision_topics {where_sql} ORDER BY next_review_date ASC, id ASC",
+                params,
+            ).fetchall()
+        return [dict(r) for r in rows]
 
     def record_topic_review(self, topic_id: int, quality: int) -> dict[str, Any]:
         with self._lock:
@@ -279,21 +335,30 @@ class PlannerDatabase:
         }
 
 
-def create_app(db: PlannerDatabase | None = None) -> FastAPI:
+def create_app(db: PlannerDatabase | None = None, db_path: str | None = None) -> FastAPI:
     owns_db = db is None
-    active_db = db or PlannerDatabase("sm2_study_planner.db")
+    resolved_db_path = db_path or os.environ.get("STUDY_PLANNER_DB_PATH", "sm2_study_planner.db")
+    state: dict[str, PlannerDatabase | None] = {"db": db}
+
+    def get_db() -> PlannerDatabase:
+        current = state["db"]
+        if current is None:
+            current = PlannerDatabase(resolved_db_path)
+            state["db"] = current
+        return current
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         try:
             yield
         finally:
-            if owns_db:
-                active_db.close()
+            if owns_db and state["db"] is not None:
+                state["db"].close()
+                state["db"] = None
 
     app = FastAPI(
         title="SM-2 Study Planner",
-        version="1.2.0",
+        version="1.3.0",
         lifespan=lifespan,
     )
 
@@ -306,15 +371,16 @@ def create_app(db: PlannerDatabase | None = None) -> FastAPI:
   <title>SM-2 Study Planner · Modules & Spaced Repetition</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <style>
-    body { background: #0a0a0c; color: #e8e6e1; font-family: system-ui, sans-serif; margin: 0; padding: 2.5rem; }
+    body { background: #0a0c10; color: #eceff4; font-family: system-ui, sans-serif; margin: 0; padding: 2.5rem; }
     .container { max-width: 1080px; margin: 0 auto; }
     h1 { font-size: 2rem; margin-bottom: 0.25rem; }
-    .sub { color: #8a8a92; font-family: monospace; font-size: 0.85rem; margin-bottom: 2rem; }
+    .sub { color: #8b96a9; font-family: monospace; font-size: 0.85rem; margin-bottom: 2rem; }
     .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 1.5rem; }
-    .card { background: #111114; border: 1px solid #232328; padding: 1.5rem; }
-    label { display: block; font-family: monospace; font-size: 0.75rem; color: #8a8a92; margin-top: 0.75rem; }
-    input, select, button { width: 100%; padding: 0.6rem; margin-top: 0.35rem; background: #0a0a0c; border: 1px solid #232328; color: #e8e6e1; box-sizing: border-box; }
-    button { background: #4ade80; color: #0a0a0c; font-weight: 700; cursor: pointer; margin-top: 1rem; border: none; }
+    .card { background: #101319; border: 1px solid #1d222c; padding: 1.5rem; }
+    label { display: block; font-size: 0.8rem; color: #8b96a9; margin-top: 0.75rem; }
+    input, button { width: 100%; padding: 0.6rem; margin-top: 0.35rem; background: #0a0c10; border: 1px solid #1d222c; color: #eceff4; box-sizing: border-box; }
+    button { background: #58c48b; color: #0a0c10; font-weight: 700; cursor: pointer; margin-top: 1rem; border: none; }
+    pre { overflow-x: auto; font-size: 0.85rem; color: #cad2df; }
   </style>
 </head>
 <body>
@@ -323,24 +389,25 @@ def create_app(db: PlannerDatabase | None = None) -> FastAPI:
     <p class="sub">FastAPI · SQLite · SuperMemo-2 Spaced Repetition · REST API (/docs)</p>
     <div class="grid">
       <div class="card">
-        <h2>Add University Module</h2>
-        <label>Module Code (e.g. CM2104)</label><input id="code" value="CM2104" />
-        <label>Module Title</label><input id="title" value="Computational Mathematics" />
-        <label>Credits</label><input id="credits" type="number" value="20" />
-        <button onclick="addModule()">Save Module</button>
+        <h2>Add Course Module</h2>
+        <label for="code">Module Code</label><input id="code" value="CM2104" />
+        <label for="title">Module Title</label><input id="title" value="Computational Mathematics" />
+        <label for="credits">Credits</label><input id="credits" type="number" value="20" />
+        <button id="save-btn">Save Module</button>
       </div>
       <div class="card">
-        <h2>Registered Modules</h2>
+        <h2>Registered Modules &amp; Due Topics</h2>
         <pre id="modules-out">Loading...</pre>
       </div>
     </div>
   </div>
   <script>
     async function refresh() {
-      const res = await fetch('/api/modules');
-      document.getElementById('modules-out').textContent = JSON.stringify(await res.json(), null, 2);
+      const [modsRes, dueRes] = await Promise.all([fetch('/api/modules'), fetch('/api/topics/due')]);
+      const data = { modules: await modsRes.json(), due_topics: await dueRes.json() };
+      document.getElementById('modules-out').textContent = JSON.stringify(data, null, 2);
     }
-    async function addModule() {
+    document.getElementById('save-btn').addEventListener('click', async () => {
       await fetch('/api/modules', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
@@ -352,7 +419,7 @@ def create_app(db: PlannerDatabase | None = None) -> FastAPI:
         })
       });
       refresh();
-    }
+    });
     refresh();
   </script>
 </body>
@@ -361,18 +428,24 @@ def create_app(db: PlannerDatabase | None = None) -> FastAPI:
     @app.post("/api/modules", status_code=201)
     def create_module(payload: ModuleCreate) -> dict[str, Any]:
         try:
-            return active_db.create_module(payload)
+            return get_db().create_module(payload)
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     @app.get("/api/modules")
     def list_modules() -> list[dict[str, Any]]:
-        return active_db.list_modules()
+        return get_db().list_modules()
+
+    @app.delete("/api/modules/{code}", status_code=204)
+    def delete_module(code: str) -> Response:
+        if not get_db().delete_module(code):
+            raise HTTPException(status_code=404, detail=f"Module '{code}' not found")
+        return Response(status_code=204)
 
     @app.post("/api/assessments", status_code=201)
     def create_assessment(payload: AssessmentCreate) -> dict[str, Any]:
         try:
-            return active_db.create_assessment(payload)
+            return get_db().create_assessment(payload)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ValueError as exc:
@@ -380,21 +453,39 @@ def create_app(db: PlannerDatabase | None = None) -> FastAPI:
 
     @app.get("/api/assessments")
     def list_assessments(module_code: str | None = None) -> list[dict[str, Any]]:
-        return active_db.list_assessments(module_code)
+        return get_db().list_assessments(module_code)
+
+    @app.patch("/api/assessments/{assessment_id}/complete")
+    def set_assessment_completed(
+        assessment_id: int,
+        payload: AssessmentStatusUpdate,
+    ) -> dict[str, Any]:
+        try:
+            return get_db().set_assessment_completed(assessment_id, payload.completed)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @app.post("/api/topics", status_code=201)
     def create_topic(module_code: str, topic: str) -> dict[str, Any]:
         try:
-            return active_db.add_revision_topic(module_code, topic)
+            return get_db().add_revision_topic(module_code, topic)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
+    @app.get("/api/topics")
+    def list_topics(module_code: str | None = None) -> list[dict[str, Any]]:
+        return get_db().list_revision_topics(module_code=module_code)
+
+    @app.get("/api/topics/due")
+    def list_due_topics(module_code: str | None = None) -> list[dict[str, Any]]:
+        return get_db().list_revision_topics(module_code=module_code, due_only=True)
+
     @app.post("/api/topics/{topic_id}/review")
     def review_topic(topic_id: int, payload: ReviewUpdate) -> dict[str, Any]:
         try:
-            return active_db.record_topic_review(topic_id, payload.quality)
+            return get_db().record_topic_review(topic_id, payload.quality)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
