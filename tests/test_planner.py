@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
-from src.study_planner.app import PlannerDatabase, compute_sm2_schedule, create_app
+from study_planner.app import PlannerDatabase, compute_sm2_schedule, create_app
 
 
 def test_sm2_spaced_repetition_interval_progression() -> None:
@@ -79,7 +79,7 @@ def test_full_module_assessment_due_queue_and_lazy_db(tmp_path: Path) -> None:
 
     topic_resp = client.post(
         "/api/topics",
-        params={"module_code": "CM2102", "topic": "BCNF and 3NF Dependency Preservation"},
+        json={"module_code": "CM2102", "topic": "BCNF and 3NF Dependency Preservation"},
     )
     assert topic_resp.status_code == 201
     topic_id = topic_resp.json()["id"]
@@ -106,12 +106,25 @@ def test_full_module_assessment_due_queue_and_lazy_db(tmp_path: Path) -> None:
     assert len(client.get("/api/assessments", params={"module_code": "CM2102"}).json()) == 1
     assert len(client.get("/api/topics", params={"module_code": "CM2102"}).json()) == 1
 
+    # Individual delete routes return 204 when present and 404 once removed
+    extra_topic = client.post(
+        "/api/topics",
+        json={"module_code": "CM2102", "topic": "Temporary topic"},
+    )
+    assert extra_topic.status_code == 201
+    extra_id = extra_topic.json()["id"]
+    assert client.delete(f"/api/topics/{extra_id}").status_code == 204
+    assert client.delete(f"/api/topics/{extra_id}").status_code == 404
+
     # Deleting module cascades cleanly to assessments and revision topics
     assert client.delete("/api/modules/CM2102").status_code == 204
     assert client.get("/api/assessments").json() == []
     assert client.get("/api/topics").json() == []
 
-    missing_topic = client.post("/api/topics", params={"module_code": "CM9999", "topic": "Orphan"})
+    missing_topic = client.post(
+        "/api/topics",
+        json={"module_code": "CM9999", "topic": "Orphan"},
+    )
     assert missing_topic.status_code == 404
 
     with pytest.raises(ValueError, match="between 0 and 5"):

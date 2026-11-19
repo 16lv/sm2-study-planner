@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import argparse
 import os
 import sqlite3
 import threading
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -31,6 +32,11 @@ class AssessmentCreate(BaseModel):
 
 class AssessmentStatusUpdate(BaseModel):
     completed: bool
+
+
+class TopicCreate(BaseModel):
+    module_code: str = Field(..., min_length=3, max_length=16)
+    topic: str = Field(..., min_length=1, max_length=200)
 
 
 class ReviewUpdate(BaseModel):
@@ -237,7 +243,8 @@ class PlannerDatabase:
                 "SELECT * FROM assessments WHERE id = ?",
                 (assessment_id,),
             ).fetchone()
-        assert row is not None
+        if row is None:
+            raise KeyError(f"Assessment ID {assessment_id} not found")
         return {
             "id": row["id"],
             "module_code": row["module_code"],
@@ -246,6 +253,18 @@ class PlannerDatabase:
             "due_date": row["due_date"],
             "completed": bool(row["completed"]),
         }
+
+    def delete_assessment(self, assessment_id: int) -> bool:
+        with self._lock:
+            cur = self._conn.execute("DELETE FROM assessments WHERE id = ?", (assessment_id,))
+            self._conn.commit()
+            return cur.rowcount > 0
+
+    def delete_revision_topic(self, topic_id: int) -> bool:
+        with self._lock:
+            cur = self._conn.execute("DELETE FROM revision_topics WHERE id = ?", (topic_id,))
+            self._conn.commit()
+            return cur.rowcount > 0
 
     def add_revision_topic(self, module_code: str, topic: str) -> dict[str, Any]:
         code = module_code.strip().upper()
@@ -368,47 +387,59 @@ def create_app(db: PlannerDatabase | None = None, db_path: str | None = None) ->
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <title>SM-2 Study Planner · Modules & Spaced Repetition</title>
+  <title>SM-2 Study Planner · Modules &amp; Spaced Repetition</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <style>
-    body { background: #0a0c10; color: #eceff4; font-family: system-ui, sans-serif; margin: 0; padding: 2.5rem; }
+    body { background: #0a0c10; color: #eceff4; font-family: system-ui, sans-serif; margin: 0; padding: 2rem; }
     .container { max-width: 1080px; margin: 0 auto; }
-    h1 { font-size: 2rem; margin-bottom: 0.25rem; }
-    .sub { color: #8b96a9; font-family: monospace; font-size: 0.85rem; margin-bottom: 2rem; }
-    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 1.5rem; }
-    .card { background: #101319; border: 1px solid #1d222c; padding: 1.5rem; }
-    label { display: block; font-size: 0.8rem; color: #8b96a9; margin-top: 0.75rem; }
-    input, button { width: 100%; padding: 0.6rem; margin-top: 0.35rem; background: #0a0c10; border: 1px solid #1d222c; color: #eceff4; box-sizing: border-box; }
-    button { background: #58c48b; color: #0a0c10; font-weight: 700; cursor: pointer; margin-top: 1rem; border: none; }
-    pre { overflow-x: auto; font-size: 0.85rem; color: #cad2df; }
+    h1 { font-size: 1.9rem; margin-bottom: 0.25rem; }
+    .sub { color: #8b96a9; font-family: monospace; font-size: 0.85rem; margin-bottom: 1.5rem; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 1.25rem; }
+    .card { background: #101319; border: 1px solid #1d222c; padding: 1.25rem; border-radius: 4px; }
+    label { display: block; font-size: 0.8rem; color: #8b96a9; margin-top: 0.7rem; }
+    input, button { width: 100%; padding: 0.55rem 0.7rem; margin-top: 0.3rem; background: #0a0c10; border: 1px solid #262e3d; color: #eceff4; box-sizing: border-box; border-radius: 3px; }
+    button { background: #58c48b; color: #0a0c10; font-weight: 600; cursor: pointer; margin-top: 0.9rem; border: none; }
+    .status { min-height: 1.25rem; margin-top: 0.6rem; font-size: 0.82rem; color: #f87171; }
+    .ok { color: #58c48b; }
+    pre { overflow-x: auto; font-size: 0.82rem; color: #cad2df; margin: 0; }
   </style>
 </head>
 <body>
   <div class="container">
     <h1>SM-2 Study Planner</h1>
-    <p class="sub">FastAPI · SQLite · SuperMemo-2 Spaced Repetition · REST API (/docs)</p>
+    <p class="sub">FastAPI · SQLite · SuperMemo-2 Spaced Repetition · OpenAPI Docs (/docs)</p>
     <div class="grid">
       <div class="card">
-        <h2>Add Course Module</h2>
+        <h2>Register Module</h2>
         <label for="code">Module Code</label><input id="code" value="CM2104" />
         <label for="title">Module Title</label><input id="title" value="Computational Mathematics" />
         <label for="credits">Credits</label><input id="credits" type="number" value="20" />
         <button id="save-btn">Save Module</button>
+        <h2 style="margin-top:1.4rem;">Add Revision Topic</h2>
+        <label for="topic-mod">Module Code</label><input id="topic-mod" value="CM2104" />
+        <label for="topic-text">Topic</label><input id="topic-text" value="Eigenvalues and diagonalisation" />
+        <button id="topic-btn">Add Topic</button>
+        <p id="form-status" class="status"></p>
       </div>
       <div class="card">
-        <h2>Registered Modules &amp; Due Topics</h2>
+        <h2>Modules &amp; Due Topics Queue</h2>
         <pre id="modules-out">Loading...</pre>
       </div>
     </div>
   </div>
   <script>
+    const statusEl = document.getElementById('form-status');
+    function showStatus(msg, ok) {
+      statusEl.textContent = msg;
+      statusEl.className = ok ? 'status ok' : 'status';
+    }
     async function refresh() {
       const [modsRes, dueRes] = await Promise.all([fetch('/api/modules'), fetch('/api/topics/due')]);
       const data = { modules: await modsRes.json(), due_topics: await dueRes.json() };
       document.getElementById('modules-out').textContent = JSON.stringify(data, null, 2);
     }
     document.getElementById('save-btn').addEventListener('click', async () => {
-      await fetch('/api/modules', {
+      const res = await fetch('/api/modules', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({
@@ -418,6 +449,29 @@ def create_app(db: PlannerDatabase | None = None, db_path: str | None = None) ->
           semester: 'Autumn'
         })
       });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        showStatus(err.detail || 'Could not save module', false);
+        return;
+      }
+      showStatus('Module saved.', true);
+      refresh();
+    });
+    document.getElementById('topic-btn').addEventListener('click', async () => {
+      const res = await fetch('/api/topics', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+          module_code: document.getElementById('topic-mod').value,
+          topic: document.getElementById('topic-text').value
+        })
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        showStatus(err.detail || 'Could not add topic', false);
+        return;
+      }
+      showStatus('Revision topic scheduled for review.', true);
       refresh();
     });
     refresh();
@@ -465,14 +519,26 @@ def create_app(db: PlannerDatabase | None = None, db_path: str | None = None) ->
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
+    @app.delete("/api/assessments/{assessment_id}", status_code=204)
+    def delete_assessment(assessment_id: int) -> Response:
+        if not get_db().delete_assessment(assessment_id):
+            raise HTTPException(status_code=404, detail=f"Assessment ID {assessment_id} not found")
+        return Response(status_code=204)
+
     @app.post("/api/topics", status_code=201)
-    def create_topic(module_code: str, topic: str) -> dict[str, Any]:
+    def create_topic(payload: TopicCreate) -> dict[str, Any]:
         try:
-            return get_db().add_revision_topic(module_code, topic)
+            return get_db().add_revision_topic(payload.module_code, payload.topic)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.delete("/api/topics/{topic_id}", status_code=204)
+    def delete_topic(topic_id: int) -> Response:
+        if not get_db().delete_revision_topic(topic_id):
+            raise HTTPException(status_code=404, detail=f"Topic ID {topic_id} not found")
+        return Response(status_code=204)
 
     @app.get("/api/topics")
     def list_topics(module_code: str | None = None) -> list[dict[str, Any]]:
@@ -493,3 +559,18 @@ def create_app(db: PlannerDatabase | None = None, db_path: str | None = None) ->
 
 
 app = create_app()
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    import uvicorn
+
+    parser = argparse.ArgumentParser(description="Start the SM-2 Study Planner API server.")
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=8000)
+    args = parser.parse_args(argv)
+    uvicorn.run("study_planner.app:app", host=args.host, port=args.port)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
