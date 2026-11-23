@@ -32,6 +32,7 @@ pip install -e ".[dev]"
 | Method | Path | Description |
 | :--- | :--- | :--- |
 | `GET` | `/` | Embedded single-page web workspace |
+| `GET` | `/api/overview` | Summary counts across modules, overdue coursework, and due topics |
 | `POST` / `GET` | `/api/modules` | Register/update or list modules |
 | `DELETE` | `/api/modules/{code}` | Remove a module and cascading assessments/topics (`204`) |
 | `POST` / `GET` | `/api/assessments` | Log coursework deadlines or filter by `?module_code=` |

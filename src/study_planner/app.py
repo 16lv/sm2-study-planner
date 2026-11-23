@@ -353,6 +353,41 @@ class PlannerDatabase:
             "next_review_date": next_date,
         }
 
+    def get_overview(self) -> dict[str, Any]:
+        today = date.today().isoformat()
+        with self._lock:
+            modules = self._conn.execute("SELECT * FROM modules ORDER BY code ASC").fetchall()
+            assessments = self._conn.execute("SELECT * FROM assessments").fetchall()
+            topic_row = self._conn.execute(
+                """
+                SELECT
+                    COUNT(*) AS total_topics,
+                    COALESCE(SUM(CASE WHEN next_review_date <= ? THEN 1 ELSE 0 END), 0) AS due_today
+                FROM revision_topics
+                """,
+                (today,),
+            ).fetchone()
+
+        total_ass = len(assessments)
+        completed_ass = sum(1 for a in assessments if bool(a["completed"]))
+        overdue_ass = sum(
+            1 for a in assessments if not bool(a["completed"]) and str(a["due_date"]) < today
+        )
+        return {
+            "module_count": len(modules),
+            "total_credits": sum(int(m["credits"]) for m in modules),
+            "assessments": {
+                "total": total_ass,
+                "completed": completed_ass,
+                "pending": total_ass - completed_ass,
+                "overdue": overdue_ass,
+            },
+            "topics": {
+                "total": int(topic_row["total_topics"]) if topic_row else 0,
+                "due_today": int(topic_row["due_today"]) if topic_row else 0,
+            },
+        }
+
 
 def create_app(db: PlannerDatabase | None = None, db_path: str | None = None) -> FastAPI:
     owns_db = db is None
@@ -478,6 +513,10 @@ def create_app(db: PlannerDatabase | None = None, db_path: str | None = None) ->
   </script>
 </body>
 </html>"""
+
+    @app.get("/api/overview")
+    def get_overview() -> dict[str, Any]:
+        return get_db().get_overview()
 
     @app.post("/api/modules", status_code=201)
     def create_module(payload: ModuleCreate) -> dict[str, Any]:

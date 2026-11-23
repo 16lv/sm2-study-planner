@@ -129,3 +129,35 @@ def test_full_module_assessment_due_queue_and_lazy_db(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="between 0 and 5"):
         compute_sm2_schedule(quality=6, repetitions=0, easiness=2.5, interval_days=1)
+
+
+def test_overview_summary_tracks_assessments_and_due_topics() -> None:
+    db = PlannerDatabase(":memory:")
+    client = TestClient(create_app(db))
+
+    assert client.post(
+        "/api/modules",
+        json={"code": "CM2208", "title": "Scientific Computing", "credits": 20, "semester": "Spring"},
+    ).status_code == 201
+
+    assert client.post(
+        "/api/assessments",
+        json={
+            "module_code": "CM2208",
+            "title": "Overdue Exercise",
+            "weight_pct": 25.0,
+            "due_date": "2020-01-10",
+            "completed": False,
+        },
+    ).status_code == 201
+
+    assert client.post(
+        "/api/topics",
+        json={"module_code": "CM2208", "topic": "LU Factorisation"},
+    ).status_code == 201
+
+    overview = client.get("/api/overview").json()
+    assert overview["module_count"] == 1
+    assert overview["total_credits"] == 20
+    assert overview["assessments"]["overdue"] == 1
+    assert overview["topics"]["due_today"] == 1
