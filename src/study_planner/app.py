@@ -207,17 +207,24 @@ class PlannerDatabase:
             "completed": payload.completed,
         }
 
-    def list_assessments(self, module_code: str | None = None) -> list[dict[str, Any]]:
+    def list_assessments(
+        self,
+        module_code: str | None = None,
+        pending_only: bool = False,
+    ) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if module_code:
+            clauses.append("module_code = ?")
+            params.append(module_code.strip().upper())
+        if pending_only:
+            clauses.append("completed = 0")
+        where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         with self._lock:
-            if module_code:
-                rows = self._conn.execute(
-                    "SELECT * FROM assessments WHERE module_code = ? ORDER BY due_date ASC",
-                    (module_code.strip().upper(),),
-                ).fetchall()
-            else:
-                rows = self._conn.execute(
-                    "SELECT * FROM assessments ORDER BY due_date ASC"
-                ).fetchall()
+            rows = self._conn.execute(
+                f"SELECT * FROM assessments {where_sql} ORDER BY due_date ASC",
+                params,
+            ).fetchall()
         return [
             {
                 "id": r["id"],
@@ -432,7 +439,7 @@ def create_app(db: PlannerDatabase | None = None, db_path: str | None = None) ->
     .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 1.25rem; }
     .card { background: #101319; border: 1px solid #1d222c; padding: 1.25rem; border-radius: 4px; }
     label { display: block; font-size: 0.8rem; color: #8b96a9; margin-top: 0.7rem; }
-    input, button { width: 100%; padding: 0.55rem 0.7rem; margin-top: 0.3rem; background: #0a0c10; border: 1px solid #262e3d; color: #eceff4; box-sizing: border-box; border-radius: 3px; }
+    input, select, button { width: 100%; padding: 0.55rem 0.7rem; margin-top: 0.3rem; background: #0a0c10; border: 1px solid #262e3d; color: #eceff4; box-sizing: border-box; border-radius: 3px; }
     button { background: #58c48b; color: #0a0c10; font-weight: 600; cursor: pointer; margin-top: 0.9rem; border: none; }
     .status { min-height: 1.25rem; margin-top: 0.6rem; font-size: 0.82rem; color: #f87171; }
     .ok { color: #58c48b; }
@@ -449,6 +456,12 @@ def create_app(db: PlannerDatabase | None = None, db_path: str | None = None) ->
         <label for="code">Module Code</label><input id="code" value="CM2104" />
         <label for="title">Module Title</label><input id="title" value="Computational Mathematics" />
         <label for="credits">Credits</label><input id="credits" type="number" value="20" />
+        <label for="semester">Semester</label>
+        <select id="semester">
+          <option value="Autumn">Autumn</option>
+          <option value="Spring">Spring</option>
+          <option value="Full Year">Full Year</option>
+        </select>
         <button id="save-btn">Save Module</button>
         <h2 style="margin-top:1.4rem;">Add Revision Topic</h2>
         <label for="topic-mod">Module Code</label><input id="topic-mod" value="CM2104" />
@@ -481,7 +494,7 @@ def create_app(db: PlannerDatabase | None = None, db_path: str | None = None) ->
           code: document.getElementById('code').value,
           title: document.getElementById('title').value,
           credits: Number(document.getElementById('credits').value),
-          semester: 'Autumn'
+          semester: document.getElementById('semester').value
         })
       });
       if (!res.ok) {
@@ -545,8 +558,11 @@ def create_app(db: PlannerDatabase | None = None, db_path: str | None = None) ->
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     @app.get("/api/assessments")
-    def list_assessments(module_code: str | None = None) -> list[dict[str, Any]]:
-        return get_db().list_assessments(module_code)
+    def list_assessments(
+        module_code: str | None = None,
+        pending_only: bool = False,
+    ) -> list[dict[str, Any]]:
+        return get_db().list_assessments(module_code, pending_only=pending_only)
 
     @app.patch("/api/assessments/{assessment_id}/complete")
     def set_assessment_completed(

@@ -35,7 +35,7 @@ pip install -e ".[dev]"
 | `GET` | `/api/overview` | Summary counts across modules, overdue coursework, and due topics |
 | `POST` / `GET` | `/api/modules` | Register/update or list modules |
 | `DELETE` | `/api/modules/{code}` | Remove a module and cascading assessments/topics (`204`) |
-| `POST` / `GET` | `/api/assessments` | Log coursework deadlines or filter by `?module_code=` |
+| `POST` / `GET` | `/api/assessments` | Log coursework deadlines or filter by `?module_code=` / `?pending_only=true` |
 | `PATCH` | `/api/assessments/{id}/complete` | Toggle coursework completion state |
 | `DELETE` | `/api/assessments/{id}` | Remove an assessment (`204`) |
 | `POST` / `GET` | `/api/topics` | Add (JSON body) or list revision flashcards |

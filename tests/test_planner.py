@@ -161,3 +161,8 @@ def test_overview_summary_tracks_assessments_and_due_topics() -> None:
     assert overview["total_credits"] == 20
     assert overview["assessments"]["overdue"] == 1
     assert overview["topics"]["due_today"] == 1
+
+    assert len(client.get("/api/assessments", params={"pending_only": "true"}).json()) == 1
+    ass_id = client.get("/api/assessments").json()[0]["id"]
+    assert client.patch(f"/api/assessments/{ass_id}/complete", json={"completed": True}).status_code == 200
+    assert client.get("/api/assessments", params={"pending_only": "true"}).json() == []
